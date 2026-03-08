@@ -228,7 +228,8 @@ func (c *Client) Closed() <-chan struct{} {
 }
 
 // CloseErr returns the error that caused the read loop to exit, or nil if
-// it has not exited yet.
+// it has not exited yet. Callers should observe Closed() before calling
+// this method to ensure the error value is visible.
 func (c *Client) CloseErr() error {
 	return c.closeErr
 }
@@ -240,23 +241,27 @@ func (c *Client) InitializedChan() <-chan struct{} {
 }
 
 // SetOutputHandler sets the callback invoked when an OutputEvent is received.
+// Must be called before ReadLoop is started; not safe for concurrent use.
 func (c *Client) SetOutputHandler(handler func(*godap.OutputEvent)) {
 	c.outputHandler = handler
 }
 
 // SetOnStopped sets the callback invoked when a StoppedEvent is received.
 // The callback is called before StopWaiter.Deliver.
+// Must be called before ReadLoop is started; not safe for concurrent use.
 func (c *Client) SetOnStopped(handler func(*godap.StoppedEvent)) {
 	c.onStopped = handler
 }
 
 // SetOnExit sets the callback invoked when an ExitedEvent is received.
 // The callback receives the exit code.
+// Must be called before ReadLoop is started; not safe for concurrent use.
 func (c *Client) SetOnExit(handler func(int)) {
 	c.onExit = handler
 }
 
 // SetOnTerminated sets the callback invoked when a TerminatedEvent is received.
+// Must be called before ReadLoop is started; not safe for concurrent use.
 func (c *Client) SetOnTerminated(handler func()) {
 	c.onTerminated = handler
 }

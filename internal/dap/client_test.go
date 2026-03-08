@@ -482,9 +482,9 @@ func TestReadLoopInterleavedResponsesAndEvents(t *testing.T) {
 
 	client := NewClient(bufio.NewReader(clientReadPR), clientWritePW)
 
-	var outputReceived atomic.Value
+	outputCh := make(chan *godap.OutputEvent, 1)
 	client.SetOutputHandler(func(event *godap.OutputEvent) {
-		outputReceived.Store(event)
+		outputCh <- event
 	})
 
 	go client.ReadLoop()
@@ -566,25 +566,17 @@ func TestReadLoopInterleavedResponsesAndEvents(t *testing.T) {
 		t.Fatal("timed out waiting for response")
 	}
 
-	// Verify output event (give a moment for the callback to be called).
-	deadline := time.After(time.Second)
-	for {
-		if v := outputReceived.Load(); v != nil {
-			event := v.(*godap.OutputEvent)
-			if event.Body.Output != "hello world\n" {
-				t.Errorf("Output: got %q, want %q", event.Body.Output, "hello world\n")
-			}
-			if event.Body.Category != "stdout" {
-				t.Errorf("Category: got %q, want %q", event.Body.Category, "stdout")
-			}
-			break
+	// Verify output event.
+	select {
+	case event := <-outputCh:
+		if event.Body.Output != "hello world\n" {
+			t.Errorf("Output: got %q, want %q", event.Body.Output, "hello world\n")
 		}
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for OutputEvent callback")
-		default:
-			time.Sleep(10 * time.Millisecond)
+		if event.Body.Category != "stdout" {
+			t.Errorf("Category: got %q, want %q", event.Body.Category, "stdout")
 		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for OutputEvent callback")
 	}
 }
 
