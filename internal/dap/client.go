@@ -34,6 +34,14 @@ type Client struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+
+	// Event infrastructure.
+	initializedChan chan struct{}
+	outputHandler   func(event *godap.OutputEvent)
+	stopWaiter      *StopWaiter
+	onStopped       func(event *godap.StoppedEvent)
+	onExit          func(exitCode int)
+	onTerminated    func()
 }
 
 // NewClient creates a new DAP client that reads from reader and writes to
@@ -41,10 +49,12 @@ type Client struct {
 // incoming messages.
 func NewClient(reader *bufio.Reader, writer io.Writer) *Client {
 	return &Client{
-		writer:  writer,
-		reader:  reader,
-		pending: make(map[int]chan pendingResult),
-		closed:  make(chan struct{}),
+		writer:          writer,
+		reader:          reader,
+		pending:         make(map[int]chan pendingResult),
+		closed:          make(chan struct{}),
+		initializedChan: make(chan struct{}, 1),
+		stopWaiter:      &StopWaiter{},
 	}
 }
 
@@ -164,14 +174,49 @@ func (c *Client) ReadLoop() {
 				close(c.closed)
 			})
 			c.cancelAllPending(fmt.Errorf("dap.Client: read loop terminated: %w", err))
+			c.stopWaiter.Cancel()
 			return
 		}
 
-		switch msg.(type) {
+		switch m := msg.(type) {
+		// Events.
+		case *godap.StoppedEvent:
+			if c.onStopped != nil {
+				c.onStopped(m)
+			}
+			c.stopWaiter.Deliver(m)
+
+		case *godap.InitializedEvent:
+			select {
+			case c.initializedChan <- struct{}{}:
+			default:
+			}
+
+		case *godap.OutputEvent:
+			if c.outputHandler != nil {
+				c.outputHandler(m)
+			}
+
+		case *godap.ExitedEvent:
+			if c.onExit != nil {
+				c.onExit(m.Body.ExitCode)
+			}
+			c.stopWaiter.DeliverExit(m.Body.ExitCode)
+
+		case *godap.TerminatedEvent:
+			if c.onTerminated != nil {
+				c.onTerminated()
+			}
+			c.stopWaiter.Cancel()
+
+		case *godap.ThreadEvent, *godap.BreakpointEvent, *godap.ProcessEvent, *godap.ContinuedEvent:
+			log.Printf("dap.Client: informational event: %T", m)
+
+		// Responses.
 		case godap.ResponseMessage:
 			c.dispatchResponse(msg)
+
 		default:
-			// Events and other message types will be handled in task 1.4.
 			log.Printf("dap.Client: unhandled message type: %T", msg)
 		}
 	}
@@ -186,4 +231,37 @@ func (c *Client) Closed() <-chan struct{} {
 // it has not exited yet.
 func (c *Client) CloseErr() error {
 	return c.closeErr
+}
+
+// InitializedChan returns a channel that receives a value when the
+// InitializedEvent is received from the debug adapter.
+func (c *Client) InitializedChan() <-chan struct{} {
+	return c.initializedChan
+}
+
+// SetOutputHandler sets the callback invoked when an OutputEvent is received.
+func (c *Client) SetOutputHandler(handler func(*godap.OutputEvent)) {
+	c.outputHandler = handler
+}
+
+// SetOnStopped sets the callback invoked when a StoppedEvent is received.
+// The callback is called before StopWaiter.Deliver.
+func (c *Client) SetOnStopped(handler func(*godap.StoppedEvent)) {
+	c.onStopped = handler
+}
+
+// SetOnExit sets the callback invoked when an ExitedEvent is received.
+// The callback receives the exit code.
+func (c *Client) SetOnExit(handler func(int)) {
+	c.onExit = handler
+}
+
+// SetOnTerminated sets the callback invoked when a TerminatedEvent is received.
+func (c *Client) SetOnTerminated(handler func()) {
+	c.onTerminated = handler
+}
+
+// StopWaiter returns the StopWaiter used to wait for stop-related events.
+func (c *Client) StopWaiter() *StopWaiter {
+	return c.stopWaiter
 }

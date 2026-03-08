@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -467,4 +468,432 @@ func TestDispatchResponseNoWaiter(t *testing.T) {
 	resp := makeInitializeResponse(1, 999)
 	// Should log but not panic.
 	client.dispatchResponse(resp)
+}
+
+func TestReadLoopInterleavedResponsesAndEvents(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	clientWritePR, clientWritePW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+		clientWritePR.Close()
+		clientWritePW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), clientWritePW)
+
+	var outputReceived atomic.Value
+	client.SetOutputHandler(func(event *godap.OutputEvent) {
+		outputReceived.Store(event)
+	})
+
+	go client.ReadLoop()
+
+	// Drain the write side so SendAsync doesn't block.
+	go func() {
+		reader := bufio.NewReader(clientWritePR)
+		for {
+			_, err := godap.ReadProtocolMessage(reader)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send a request to register a pending entry.
+	req := &godap.InitializeRequest{}
+	req.Type = "request"
+	req.Command = "initialize"
+	req.Arguments = godap.InitializeRequestArguments{
+		ClientID:  "test",
+		AdapterID: "lldb-dap",
+	}
+
+	ch, err := client.SendAsync(ctx, req)
+	if err != nil {
+		t.Fatalf("SendAsync returned error: %v", err)
+	}
+
+	seqNum := req.GetRequest().Seq
+
+	// Write an InitializedEvent first.
+	initEvent := &godap.InitializedEvent{}
+	initEvent.Type = "event"
+	initEvent.Event.Event = "initialized"
+	if err := godap.WriteProtocolMessage(clientReadPW, initEvent); err != nil {
+		t.Fatalf("failed to write InitializedEvent: %v", err)
+	}
+
+	// Write an OutputEvent.
+	outEvent := &godap.OutputEvent{}
+	outEvent.Type = "event"
+	outEvent.Event.Event = "output"
+	outEvent.Body = godap.OutputEventBody{
+		Category: "stdout",
+		Output:   "hello world\n",
+	}
+	if err := godap.WriteProtocolMessage(clientReadPW, outEvent); err != nil {
+		t.Fatalf("failed to write OutputEvent: %v", err)
+	}
+
+	// Write the response for the pending request.
+	resp := makeInitializeResponse(10, seqNum)
+	if err := godap.WriteProtocolMessage(clientReadPW, resp); err != nil {
+		t.Fatalf("failed to write InitializeResponse: %v", err)
+	}
+
+	// Verify initialized event.
+	select {
+	case <-client.InitializedChan():
+		// Expected.
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for InitializedEvent")
+	}
+
+	// Verify response.
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			t.Fatalf("expected nil error, got: %v", result.err)
+		}
+		if _, ok := result.msg.(*godap.InitializeResponse); !ok {
+			t.Fatalf("expected *InitializeResponse, got %T", result.msg)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for response")
+	}
+
+	// Verify output event (give a moment for the callback to be called).
+	deadline := time.After(time.Second)
+	for {
+		if v := outputReceived.Load(); v != nil {
+			event := v.(*godap.OutputEvent)
+			if event.Body.Output != "hello world\n" {
+				t.Errorf("Output: got %q, want %q", event.Body.Output, "hello world\n")
+			}
+			if event.Body.Category != "stdout" {
+				t.Errorf("Category: got %q, want %q", event.Body.Category, "stdout")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for OutputEvent callback")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestReadLoopStoppedEvent(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), io.Discard)
+
+	var stoppedCallback atomic.Value
+	client.SetOnStopped(func(event *godap.StoppedEvent) {
+		stoppedCallback.Store(event)
+	})
+
+	go client.ReadLoop()
+
+	// Register a waiter before the event arrives.
+	waiterCh := client.StopWaiter().Register()
+
+	// Write a StoppedEvent.
+	event := &godap.StoppedEvent{}
+	event.Type = "event"
+	event.Event.Event = "stopped"
+	event.Body = godap.StoppedEventBody{
+		Reason:   "breakpoint",
+		ThreadId: 1,
+	}
+	if err := godap.WriteProtocolMessage(clientReadPW, event); err != nil {
+		t.Fatalf("failed to write StoppedEvent: %v", err)
+	}
+
+	// Verify StopWaiter receives the event.
+	select {
+	case result := <-waiterCh:
+		if result.Event == nil {
+			t.Fatal("expected Event to be non-nil")
+		}
+		if result.Event.Body.Reason != "breakpoint" {
+			t.Errorf("Reason: got %q, want %q", result.Event.Body.Reason, "breakpoint")
+		}
+		if result.Event.Body.ThreadId != 1 {
+			t.Errorf("ThreadId: got %d, want 1", result.Event.Body.ThreadId)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for StopResult")
+	}
+
+	// Verify onStopped callback was called.
+	v := stoppedCallback.Load()
+	if v == nil {
+		t.Fatal("expected onStopped callback to be called")
+	}
+	cbEvent := v.(*godap.StoppedEvent)
+	if cbEvent.Body.Reason != "breakpoint" {
+		t.Errorf("callback Reason: got %q, want %q", cbEvent.Body.Reason, "breakpoint")
+	}
+}
+
+func TestReadLoopExitedEvent(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), io.Discard)
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1) // sentinel value
+	client.SetOnExit(func(code int) {
+		exitCode.Store(int32(code))
+	})
+
+	go client.ReadLoop()
+
+	// Register a waiter.
+	waiterCh := client.StopWaiter().Register()
+
+	// Write an ExitedEvent.
+	event := &godap.ExitedEvent{}
+	event.Type = "event"
+	event.Event.Event = "exited"
+	event.Body = godap.ExitedEventBody{
+		ExitCode: 42,
+	}
+	if err := godap.WriteProtocolMessage(clientReadPW, event); err != nil {
+		t.Fatalf("failed to write ExitedEvent: %v", err)
+	}
+
+	// Verify StopWaiter receives the exit.
+	select {
+	case result := <-waiterCh:
+		if !result.Exited {
+			t.Error("expected Exited to be true")
+		}
+		if result.ExitCode == nil {
+			t.Fatal("expected ExitCode to be non-nil")
+		}
+		if *result.ExitCode != 42 {
+			t.Errorf("ExitCode: got %d, want 42", *result.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for StopResult")
+	}
+
+	// Verify onExit callback was called.
+	if got := exitCode.Load(); got != 42 {
+		t.Errorf("onExit exitCode: got %d, want 42", got)
+	}
+}
+
+func TestReadLoopTerminatedEvent(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), io.Discard)
+
+	var terminated atomic.Bool
+	client.SetOnTerminated(func() {
+		terminated.Store(true)
+	})
+
+	go client.ReadLoop()
+
+	// Register a waiter.
+	waiterCh := client.StopWaiter().Register()
+
+	// Write a TerminatedEvent.
+	event := &godap.TerminatedEvent{}
+	event.Type = "event"
+	event.Event.Event = "terminated"
+	if err := godap.WriteProtocolMessage(clientReadPW, event); err != nil {
+		t.Fatalf("failed to write TerminatedEvent: %v", err)
+	}
+
+	// Verify StopWaiter receives the cancel.
+	select {
+	case result := <-waiterCh:
+		if !result.Terminated {
+			t.Error("expected Terminated to be true")
+		}
+		if result.Event != nil {
+			t.Error("expected Event to be nil")
+		}
+		if result.Exited {
+			t.Error("expected Exited to be false")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for StopResult")
+	}
+
+	// Verify onTerminated callback was called.
+	if !terminated.Load() {
+		t.Error("expected onTerminated callback to be called")
+	}
+}
+
+func TestReadLoopEOF(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	clientWritePR, clientWritePW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+		clientWritePR.Close()
+		clientWritePW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), clientWritePW)
+
+	// Drain the write side so SendAsync doesn't block.
+	go func() {
+		reader := bufio.NewReader(clientWritePR)
+		for {
+			_, err := godap.ReadProtocolMessage(reader)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go client.ReadLoop()
+
+	// Register a StopWaiter.
+	waiterCh := client.StopWaiter().Register()
+
+	// Create pending requests.
+	ctx := context.Background()
+	const numRequests = 2
+	channels := make([]<-chan pendingResult, numRequests)
+	for i := 0; i < numRequests; i++ {
+		req := &godap.InitializeRequest{}
+		req.Type = "request"
+		req.Command = "initialize"
+		req.Arguments = godap.InitializeRequestArguments{
+			ClientID:  "test",
+			AdapterID: "lldb-dap",
+		}
+		ch, err := client.SendAsync(ctx, req)
+		if err != nil {
+			t.Fatalf("SendAsync[%d] failed: %v", i, err)
+		}
+		channels[i] = ch
+	}
+
+	// Close the reader to trigger EOF.
+	clientReadPW.Close()
+
+	// Verify all pending requests receive errors.
+	for i, ch := range channels {
+		select {
+		case result := <-ch:
+			if result.err == nil {
+				t.Errorf("channel[%d]: expected error, got nil", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("channel[%d]: timed out waiting for error", i)
+		}
+	}
+
+	// Verify StopWaiter was cancelled.
+	select {
+	case result := <-waiterCh:
+		if !result.Terminated {
+			t.Error("expected StopWaiter result to have Terminated=true")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for StopWaiter cancel")
+	}
+
+	// Verify the client is closed.
+	select {
+	case <-client.Closed():
+		// Expected.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for client to close")
+	}
+}
+
+func TestReadLoopInitializedEvent(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), io.Discard)
+	go client.ReadLoop()
+
+	// Write an InitializedEvent.
+	event := &godap.InitializedEvent{}
+	event.Type = "event"
+	event.Event.Event = "initialized"
+	if err := godap.WriteProtocolMessage(clientReadPW, event); err != nil {
+		t.Fatalf("failed to write InitializedEvent: %v", err)
+	}
+
+	// Verify it's received on InitializedChan.
+	select {
+	case <-client.InitializedChan():
+		// Expected.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for InitializedEvent on InitializedChan")
+	}
+}
+
+func TestReadLoopOutputEvent(t *testing.T) {
+	clientReadPR, clientReadPW := io.Pipe()
+	t.Cleanup(func() {
+		clientReadPR.Close()
+		clientReadPW.Close()
+	})
+
+	client := NewClient(bufio.NewReader(clientReadPR), io.Discard)
+
+	outputCh := make(chan *godap.OutputEvent, 1)
+	client.SetOutputHandler(func(event *godap.OutputEvent) {
+		outputCh <- event
+	})
+
+	go client.ReadLoop()
+
+	// Write an OutputEvent.
+	event := &godap.OutputEvent{}
+	event.Type = "event"
+	event.Event.Event = "output"
+	event.Body = godap.OutputEventBody{
+		Category: "stderr",
+		Output:   "error message\n",
+	}
+	if err := godap.WriteProtocolMessage(clientReadPW, event); err != nil {
+		t.Fatalf("failed to write OutputEvent: %v", err)
+	}
+
+	// Verify the output handler callback is invoked.
+	select {
+	case received := <-outputCh:
+		if received.Body.Category != "stderr" {
+			t.Errorf("Category: got %q, want %q", received.Body.Category, "stderr")
+		}
+		if received.Body.Output != "error message\n" {
+			t.Errorf("Output: got %q, want %q", received.Body.Output, "error message\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OutputEvent callback")
+	}
 }
